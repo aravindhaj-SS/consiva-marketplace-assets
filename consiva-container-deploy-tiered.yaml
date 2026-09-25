@@ -1,0 +1,766 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Consiva.ai - AWS Marketplace Container Product deployment template.
+  Provisions (optionally) a new VPC, an RDS SQL Server database, and an
+  ECS Fargate service running the Consiva backend (.NET) and frontend
+  (Next.js) containers side-by-side, fronted by an Application Load
+  Balancer with path-based routing (/api/* -> backend, everything else
+  -> frontend).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcId
+          - PublicSubnetIds
+          - PrivateSubnetIds
+      - Label:
+          default: Container Images (provided by AWS Marketplace ECR)
+        Parameters:
+          - BackendImage
+          - FrontendImage
+      - Label:
+          default: Sizing
+        Parameters:
+          - TaskCpu
+          - TaskMemory
+          - DesiredCount
+      - Label:
+          default: Database
+        Parameters:
+          - DBInstanceClass
+          - DBAllocatedStorage
+          - DBEngine
+          - DBMultiAZ
+      - Label:
+          default: HTTPS
+        Parameters:
+          - CertificateArn
+      - Label:
+          default: Application URL
+        Parameters:
+          - AppDomainUrl
+      - Label:
+          default: Outbound Email (SMTP) - required
+        Parameters:
+          - SmtpHost
+          - SmtpPort
+          - SmtpUsername
+          - SmtpPassword
+          - SmtpFromEmail
+          - SmtpFromName
+      - Label:
+          default: Enterprise tier (optional)
+        Parameters:
+          - EnterpriseLicenseKey
+    ParameterLabels:
+      EnterpriseLicenseKey:
+        default: "Enterprise license key (leave blank for the Free tier)"
+      VpcId:
+        default: "Existing VPC ID (leave blank to create a new one)"
+      PublicSubnetIds:
+        default: "Existing public subnet IDs, comma separated (leave blank to create new)"
+      PrivateSubnetIds:
+        default: "Existing private subnet IDs, comma separated (leave blank to create new)"
+
+Parameters:
+  VpcId:
+    Type: String
+    Default: ""
+    Description: Leave blank to have this template create a new VPC automatically.
+
+  PublicSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Only used if VpcId is provided. Two public subnet IDs for the ALB.
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Only used if VpcId is provided. Two private subnet IDs for ECS tasks and RDS.
+
+  BackendImage:
+    Type: String
+    Description: Full ECR image URI for the Consiva backend (.NET API) container, as provided on your AWS Marketplace subscription page.
+
+  FrontendImage:
+    Type: String
+    Description: Full ECR image URI for the Consiva frontend (Next.js) container, as provided on your AWS Marketplace subscription page.
+
+  TaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+    Description: Total vCPU units shared by both containers in the task (1024 = 1 vCPU).
+
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["1024", "2048", "4096", "8192"]
+    Description: Total memory (MB) shared by both containers in the task.
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of task copies to run. Increase for high availability.
+
+  DBEngine:
+    Type: String
+    Default: sqlserver-ex
+    AllowedValues: ["sqlserver-ex", "sqlserver-web", "sqlserver-se"]
+    Description: sqlserver-ex is free-tier eligible and suitable for evaluation/small deployments. Use sqlserver-se for production scale.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.small
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 50
+    MinValue: 20
+
+  DBMultiAZ:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true for production high availability (doubles RDS cost).
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ACM Certificate ARN for your domain, used to serve the app over HTTPS.
+      If left blank, the ALB will only serve HTTP on port 80 - fine for a
+      quick evaluation, but not recommended for real use.
+
+  AppDomainUrl:
+    Type: String
+    Description: >
+      The full https:// URL this deployment will be reached at (your own domain
+      if you're bringing one and set CertificateArn, or the Load Balancer's own
+      DNS name from this stack's Outputs if not - you can update the stack with
+      this value after first deploy once you know it).
+
+  # Outbound email is a hard requirement in self-hosted mode, not an optional
+  # extra - the backend refuses to start without it. Verification OTPs go to
+  # external data principals exercising their DPDP rights, and breach
+  # notifications go to CERT-In and the Data Protection Board; those recipients
+  # have no way to recover from a silently dropped message, so a half-configured
+  # deployment must fail loudly instead of appearing to work.
+  SmtpHost:
+    Type: String
+    Description: Your own SMTP relay hostname (Microsoft 365, Google Workspace, Amazon SES's SMTP interface, on-prem Exchange, ...). Required.
+
+  SmtpPort:
+    Type: String
+    Default: "587"
+    Description: 587 for STARTTLS (usual), or 465 for implicit TLS.
+
+  SmtpUsername:
+    Type: String
+    Description: SMTP username. Required.
+
+  SmtpPassword:
+    Type: String
+    NoEcho: true
+    Description: >
+      SMTP password. Required. NoEcho masks this in the Console/CLI display; it
+      remains readable in plaintext to principals in YOUR OWN account holding
+      DescribeStacks on this stack - your administrators, never Consiva and
+      never another customer.
+
+  SmtpFromEmail:
+    Type: String
+    Description: The From address outbound mail is sent as. Required.
+
+  SmtpFromName:
+    Type: String
+    Default: "Consiva CMP"
+    Description: The display name outbound mail is sent as.
+
+  EnterpriseLicenseKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Provided by Consiva after you accept a Private Offer for the Enterprise tier. Leave
+      blank to use the Free tier. The key is checked inside your own account - nothing is
+      sent to Consiva or to AWS. A blank, invalid or expired key does not block the
+      deployment: it starts normally on the Free tier and records the reason in its logs.
+
+Conditions:
+  CreateNewVpc: !Equals [!Ref VpcId, ""]
+  UseHttps: !Not [!Equals [!Ref CertificateArn, ""]]
+  PlainHttpOnly: !Equals [!Ref CertificateArn, ""]
+
+Resources:
+
+  # ============================================================
+  # Networking - only created if the customer did not supply an
+  # existing VPC. Two public subnets (for the ALB) and two
+  # private subnets (for ECS tasks and RDS) across two AZs.
+  # ============================================================
+
+  NewVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNewVpc
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: consiva-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNewVpc
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: consiva-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: consiva-public-b
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+      CidrBlock: 10.20.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: consiva-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: consiva-private-b
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNewVpc
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNewVpc
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: consiva-nat
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNewVpc
+    Properties:
+      VpcId: !Ref NewVpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNewVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNewVpc
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound web traffic to the ALB
+      VpcId: !If [CreateNewVpc, !Ref NewVpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound traffic to ECS tasks only from the ALB
+      VpcId: !If [CreateNewVpc, !Ref NewVpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound SQL Server traffic only from ECS tasks
+      VpcId: !If [CreateNewVpc, !Ref NewVpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+  # ============================================================
+  # Database - credentials generated and stored in Secrets Manager,
+  # never exposed as a plain CloudFormation parameter.
+  # ============================================================
+
+  JwtSecretResource:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-jwt-secret"
+      Description: Auto-generated JWT signing secret, unique per deployment - never shared with our own SaaS servers or any other customer's deployment.
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: "secret"
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+
+  DbCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-db-credentials"
+      Description: Consiva database admin credentials, generated at deploy time.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "consivaadmin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 24
+        # This password is interpolated mid-string into the ADO.NET connection string below
+        # (Password=${Password};TrustServerCertificate=...), so every character with syntactic
+        # meaning there has to be excluded or generation can produce a password that silently
+        # corrupts the connection string:
+        #   ;   ends the keyword=value pair, so the rest of the password becomes garbage keywords
+        #   =   separates keyword from value, making the pair ambiguous
+        #   '   opens a quoted value, swallowing everything up to the next quote
+        #   " { } other quoting/escaping forms the parser honours
+        # " @ / \ were already excluded and stay: RDS additionally forbids / " @ and spaces in a
+        # SQL Server master password, so those are required regardless of the parsing issue.
+        #
+        # This is a latent fault, not a regression — it only bites when generation happens to
+        # emit one of these characters, which is why it survived several successful deploys
+        # before failing. 24 characters drawn from the ~85 that remain is still far more
+        # entropy than this credential needs.
+        ExcludeCharacters: '"@/\;=''{}'
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for the Consiva RDS instance
+      SubnetIds: !If
+        - CreateNewVpc
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - !Ref PrivateSubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Both are needed, for two different destruction triggers: DeletionPolicy covers the
+    # stack being deleted, UpdateReplacePolicy covers a stack UPDATE that forces replacement
+    # (changing an immutable RDS property). Without the latter, a routine parameter change
+    # could silently discard the customer's consent records with no snapshot taken.
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: !Ref DBEngine
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MultiAZ: !Ref DBMultiAZ
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbCredentialsSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbCredentialsSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+
+  # ============================================================
+  # Load Balancer - path-based routing: /api/* -> backend,
+  # everything else -> frontend.
+  # ============================================================
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !If
+        - CreateNewVpc
+        - [!Ref PublicSubnetA, !Ref PublicSubnetB]
+        - !Ref PublicSubnetIds
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !If [CreateNewVpc, !Ref NewVpc, !Ref VpcId]
+      HealthCheckPath: /
+      # "/" is not a 200 — an unauthenticated request to the dashboard root is answered by
+      # Next.js with a 307 to /login, which is the correct behaviour, not an error. The ALB's
+      # default matcher accepts 200 only, so without this the frontend target never becomes
+      # healthy, ECS kills the task as failed, and the service sits in a crash-restart loop
+      # on a perfectly working container. Previously patched by hand with
+      # `aws elbv2 modify-target-group` on each test stack; this is that same value, applied
+      # permanently so a customer's first launch doesn't hit it.
+      #
+      # BackendTargetGroup deliberately does NOT get this: its /health endpoint is a plain
+      # Results.Ok (verified 200 on every probe), so 200-only stays the stricter, correct
+      # check there — a redirect from /health would be a real fault worth failing on.
+      Matcher:
+        HttpCode: "200-399"
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !If [CreateNewVpc, !Ref NewVpc, !Ref VpcId]
+      HealthCheckPath: /health
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - UseHttps
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref FrontendTargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: UseHttps
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  ApiPathRuleHttp:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: UseHttps
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  ApiPathRuleHttpOnly:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: PlainHttpOnly
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # The consent SDK is served as a plain static file BY THE BACKEND
+  # (CMP.API/wwwroot/sdk.js), and the embed snippet the app generates for each
+  # customer domain points at <AppDomainUrl>/sdk.js. Without these two rules that
+  # path falls through to the frontend's default action, and the Next.js app has
+  # no such file - every website embedding the banner would 404 and show nothing.
+  # Not optional polish: this is the product's actual consent banner.
+  SdkPathRuleHttp:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: UseHttps
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 3
+      Conditions:
+        - Field: path-pattern
+          Values: ["/sdk.js", "/sdk.min.js"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  SdkPathRuleHttpOnly:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: PlainHttpOnly
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 4
+      Conditions:
+        - Field: path-pattern
+          Values: ["/sdk.js", "/sdk.min.js"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # ============================================================
+  # ECS - one cluster, one task definition with both containers,
+  # one service registered to both target groups.
+  # ============================================================
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDbSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbCredentialsSecret
+                  - !Ref JwtSecretResource
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-backend"
+      RetentionInDays: 30
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-frontend"
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-task"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      # GetAtt, not Ref: Ref on an IAM::Role returns the role NAME, and this
+      # property is declared as an ARN.
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings: [{ ContainerPort: 5000 }]
+          Environment:
+            - Name: ASPNETCORE_ENVIRONMENT
+              Value: SelfHosted
+            - Name: DEPLOYMENT_MODE
+              Value: self-hosted
+            - Name: Jwt__Secret
+              Value: !Sub "{{resolve:secretsmanager:${JwtSecretResource}:SecretString:secret}}"
+            # IPAddressPreference=IPv4First works around a Microsoft.Data.SqlClient
+            # fault in IP address resolution on Linux containers connecting to SQL
+            # Server (segfault). Already validated for this codebase in another
+            # deployment context - do not remove it.
+            - Name: ConnectionStrings__DefaultConnection
+              Value: !Sub
+                - "Server=${Endpoint},1433;Database=CookieConsentDB;User Id=${Username};Password=${Password};TrustServerCertificate=True;Encrypt=True;IPAddressPreference=IPv4First;"
+                - Endpoint: !GetAtt Database.Endpoint.Address
+                  Username: !Sub "{{resolve:secretsmanager:${DbCredentialsSecret}:SecretString:username}}"
+                  Password: !Sub "{{resolve:secretsmanager:${DbCredentialsSecret}:SecretString:password}}"
+            # All three are deliberately the same value. There is no separate CDN in
+            # this deployment model - one origin serves the dashboard, the API and
+            # /sdk.js - so the SDK embed snippet's host and the dashboard's own CORS
+            # allowlist are both just this deployment's own URL.
+            - Name: App__FrontendBaseUrl
+              Value: !Ref AppDomainUrl
+            - Name: CdnBaseUrl
+              Value: !Ref AppDomainUrl
+            - Name: Cors__AllowedOrigins__0
+              Value: !Ref AppDomainUrl
+            - Name: Smtp__Host
+              Value: !Ref SmtpHost
+            - Name: Smtp__Port
+              Value: !Ref SmtpPort
+            - Name: Smtp__Username
+              Value: !Ref SmtpUsername
+            - Name: Smtp__Password
+              Value: !Ref SmtpPassword
+            - Name: Smtp__FromEmail
+              Value: !Ref SmtpFromEmail
+            - Name: Smtp__FromName
+              Value: !Ref SmtpFromName
+            # Blank = Free tier. A valid signed key = Enterprise. Verified offline against a
+            # public key baked into the image; the verification public key is deliberately NOT
+            # a parameter — it is identical for every deployment and must not be customer-set.
+            - Name: EnterpriseLicenseKey
+              Value: !Ref EnterpriseLicenseKey
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings: [{ ContainerPort: 3000 }]
+          Environment:
+            # INERT — kept only so this value never contradicts the image. Next.js inlines
+            # every NEXT_PUBLIC_* into the client bundle at BUILD time, so setting it here at
+            # runtime cannot change what the browser actually runs; the real value is baked in
+            # by src/frontend/Dockerfile. "/" (not "/api") because this is an ORIGIN, not a
+            # path prefix — request paths already carry their own "/api/v1/...".
+            - Name: NEXT_PUBLIC_API_URL
+              Value: "/"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener]
+    Properties:
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !If
+            - CreateNewVpc
+            - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+            - !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref EcsSecurityGroup]
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 3000
+          TargetGroupArn: !Ref FrontendTargetGroup
+        - ContainerName: backend
+          ContainerPort: 5000
+          TargetGroupArn: !Ref BackendTargetGroup
+
+Outputs:
+  ApplicationUrl:
+    Description: URL to access Consiva once the stack finishes deploying (allow a few minutes for containers to start)
+    Value: !If
+      - UseHttps
+      - !Sub "https://${LoadBalancer.DNSName}"
+      - !Sub "http://${LoadBalancer.DNSName}"
+
+  DatabaseEndpoint:
+    Description: RDS SQL Server endpoint (for reference / manual DB tools)
+    Value: !GetAtt Database.Endpoint.Address
+
+  DbCredentialsSecretArn:
+    Description: Secrets Manager ARN holding the generated DB username/password
+    Value: !Ref DbCredentialsSecret
