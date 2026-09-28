@@ -462,6 +462,9 @@ Resources:
       PubliclyAccessible: false
       StorageEncrypted: true
       BackupRetentionPeriod: 7
+      Tags:
+        - Key: aws-apn-id
+          Value: "pc:epm5e0augm9ecle6qxdy71jlm"
 
   # ============================================================
   # Load Balancer - path-based routing: /api/* -> backend,
@@ -607,6 +610,9 @@ Resources:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: !Sub "${AWS::StackName}-cluster"
+      Tags:
+        - Key: aws-apn-id
+          Value: "pc:epm5e0augm9ecle6qxdy71jlm"
 
   TaskExecutionRole:
     Type: AWS::IAM::Role
@@ -653,6 +659,9 @@ Resources:
       # GetAtt, not Ref: Ref on an IAM::Role returns the role NAME, and this
       # property is declared as an ARN.
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Tags:
+        - Key: aws-apn-id
+          Value: "pc:epm5e0augm9ecle6qxdy71jlm"
       ContainerDefinitions:
         - Name: backend
           Image: !Ref BackendImage
@@ -733,6 +742,10 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref DesiredCount
       LaunchType: FARGATE
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - Key: aws-apn-id
+          Value: "pc:epm5e0augm9ecle6qxdy71jlm"
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
